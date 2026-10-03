@@ -1,0 +1,311 @@
+# Agent 执行指南（裸环境版）：把 H3 工作流注册成 ComfyTV 可直接使用的 Node 2.0 节点
+
+> **读者**：AI Agent——假设你的环境是**干净的第三方环境**：只装了 ComfyUI + ComfyTV（+ H3 自定义节点与模型），
+> 没有任何外围辅助工具。照本文可独立完成：
+> H3 工作流 → ComfyTV 注册 → binding 全部校准 → 画布上以 Node 2.0/V2 节点形态直接可用。
+>
+> **证据来源**：ComfyTV 源码实读（`api/workflows.py`、`runners/workflow_db/seed.py`、`api/mcp_tools/workflows.py`、
+> `nodes/stages/generators.py`、`api/mcp_tools/_option_check.py`）+ ComfyTV **自带的 H3 preset 范例**（`workflows/video/local-minimax-h3-*_preset.json`），
+> 实读时点 2026-10-02。本文所有机制均引自当时代码，不依赖记忆；若你的 ComfyTV 版本更新，以盘上代码为准。
+
+---
+
+## 0. 30 秒结论
+
+1. ComfyTV 里"节点"= **stage 节点 + 它选中的 workflow**。注册 workflow 只要三件事：**GUI 格式 JSON 进库 → 生成 api_json → preset 绑定落库**，全部有 HTTP 端点，不需要改代码。
+2. **Node 2.0 是显示层开关，不是注册格式**：ComfyUI 前端的 *Node 2.0 (Vue nodes)* 设置 + ComfyTV 设置里的 *启用 ComfyTV V2 节点*。绑定做好后打开这两个开关刷新即可（§5）。
+3. **stage 参数校准的本质 = 一条解析优先级**：`option:<key>` 运行时按 *stage widget → stage 参数默认值 → preset 绑定 default → 空* 解析；每一环都要接上，否则静默为空（§4）。
+4. **别从零写 preset**：ComfyTV 装好就自带 3 个 H3 工作流的 preset 模板（§2.3），照抄改节点 id 即可。
+
+---
+
+## 1. 名词与数据模型（5 分钟）
+
+### 1.1 四件套
+
+```
+你的 H3 画布文件(GUI 格式)                     ← 必须有顶层 "nodes" 数组
+ComfyTV 工作流库 user/comfytv/workflows/video/<文件名>.json     ← 目录决定 kind=video
+        │  rescan / import 时
+        ├─→ DB comfytv_workflows 行（label、file_mtime、api_json、result、sizing、prune…）
+        │
+<文件名>_preset.json（与工作流文件同目录、同名）
+        │  新行 seed 时自动应用；旧行需 POST reset_to_preset
+        └─→ DB comfytv_workflow_input_bindings（node_id / input_name / "from" / default / cast / required / error_msg）
+                                                        ↑
+                          画布 VideoStage 运行时：把 stage 的值按这些行写进 api_json 再提交 ComfyUI
+```
+
+- **kind 由目录决定**：视频一律 `workflows/video/` → 画布上的 **Video Stage**（`ComfyTV.VideoStage`）。
+- **preset 文件名 = 工作流文件名（stem）+ `_preset.json`**，代码按 `file_path` 推导（`seed.py::_preset_file_path`），**不是按 label**。
+- **`file_mtime` 变化 ⇒ ComfyTV 把 `api_json` 清空**（`seed.py:487-488`）→ 必须重新 convert（§3.3）。
+
+### 1.2 "Node 2.0 节点"到底是什么
+
+| 东西 | 是什么 | 在哪 |
+|---|---|---|
+| **ComfyUI Node 2.0（Vue 节点）** | ComfyUI 前端新一代画布渲染模式 | ComfyUI 前端 Settings |
+| **ComfyTV V2 节点** | ComfyTV 的"内容优先"stage 节点外壳（亮/暗双皮肤），**依赖上一项先开启** | ComfyTV 侧栏 Settings → Experimental → **启用 ComfyTV V2 节点**（`enable-v2`，默认关，实验性） |
+
+**关键认知**：二者都是**显示层皮肤**。workflow 注册、binding、stage 参数校准与它们**完全无关**——
+先按 §3 把绑定做完做对，最后开开关刷新（§5）。没有任何"注册成 2.0 格式"的动作可做，谁告诉你有谁就在编。
+
+### 1.3 ComfyTV 自带的 H3 资产（模板，别从零写）
+
+装好 ComfyTV 后 `workflows/video/` 里已有：
+
+| 文件 | 说明 |
+|---|---|
+| `local-minimax-h3-t2v` + `_preset.json` | H3 文生视频（含 17k+5 帧长表达式范例） |
+| `local-minimax-h3-r2v` + `_preset.json` | H3 参考生视频（**9 图 + 2 视频 + 3 音频参考槽 + 完整 prune 范例**） |
+| `local-minimax-h3-flf2v` + `_preset.json` | H3 首尾帧 |
+| `workflows/video/README.md` | H3 模型文件清单（缺模型先照它下载） |
+
+模型要求以该 README 和 `GET /object_info` 为准——**不要假设模型已存在**。
+
+---
+
+## 2. 前置检查（fail fast，任一不过就停）
+
+```bash
+# 1) ComfyTV 活着
+curl -s http://127.0.0.1:8188/comfytv/workflows | head
+# 2) H3 节点类已注册（换你的 H3 类名；官方模板用 MiniMaxH3ReferenceToVideo / MiniMaxH3ImageToVideo）
+curl -s http://127.0.0.1:8188/object_info | grep -o '"MiniMaxH3[A-Za-z]*"' | sort -u
+# 3) 模型齐（缺了 Run 时才崩，先看 workflows/video/README.md）
+```
+
+你的 H3 工作流若是从别处拷来的：**必须是 GUI 格式**（ComfyUI 正常 *Workflow → Save* 的产物，有顶层 `nodes`）；
+"Save (API Format)" 不行——ComfyTV seed 时会警告并拒绝当工作流用（`seed.py::_is_gui_format`）。
+
+---
+
+## 3. 注册八步（HTTP 通用路径，任何 shell 都能跑）
+
+> 端点基址 = 你的 ComfyUI/ComfyTV 实例（默认 `http://127.0.0.1:8188`，按实际端口替换，下同）。三个操作界面任选：
+> **HTTP 直调**（本文主线）｜**MCP**（`POST /comfytv/mcp`，工具自带校验，§5.2）｜**ComfyTV 侧栏**（人工）。
+> MCP 的 workflow 系工具是**服务端落库、无需开浏览器 tab**（源码 docstring: "Server-side — no open page needed"）。
+
+### 3.1 入库（三选一）
+
+```bash
+# A. HTTP 导入（无需文件系统权限，推荐给 agent）
+curl -s -X POST http://127.0.0.1:8188/comfytv/workflows/import \
+  -H 'Content-Type: application/json' \
+  -d '{"kind":"video","filename":"my-h3-workflow.json","content":"<整个 GUI JSON 文本>"}'
+# B. 文件放进 user/comfytv/workflows/video/ 后：
+curl -s -X POST http://127.0.0.1:8188/comfytv/workflows/rescan
+# C. 画布 UI：workflow 下拉下的 🔗 Link（推荐，改完保存自动同步）/ ⬆ Upload
+```
+
+拿到 `label`（= 文件名 stem，重名会自动加后缀）。**后续所有调用的 label 以此行返回为准**。
+
+### 3.2 写 preset（核心，先识别节点再写）
+
+**先按 `class_type` 识别角色**（永远不要假设节点 id，不同工作流 id 全不同）：
+
+| 角色 | 怎么找 | 绑什么 |
+|---|---|---|
+| 提示词入口 | H3 主节点的 `prompt`/`text` 输入，或文本节点（`CR Text`、`PrimitiveStringMultiline`） | `main_prompt` |
+| 参考图槽 | `LoadImage`（多参考 = 多个） | `upstream_image:annotated[N]` |
+| 尺寸 | H3 主节点/尺寸节点的 `width`/`height` | `computed:width` / `computed:height` |
+| 时长 | 秒数入口（`PrimitiveFloat.value` 之类） | `option:duration_s` |
+| 帧长换算 | `ComfyMathExpression`（把秒换算成 **17k+5 网格**合法帧长） | 一般不用绑，接在时长下游即可 |
+| seed | `RandomNoise.noise_seed` | `option:seed`, `default:"random_int31"`, `cast:"int"` |
+| 输出 | 最终视频保存节点（`VHS_VideoCombine` / `SaveVideo` / `CreateVideo→Save…`） | `result.node` |
+
+⚠️ **绑定目标字段名以 api_json 里该节点 `inputs` 的真实 keys 为准**：
+`PrimitiveString/PrimitiveInt/PrimitiveFloat` 的 widget 名是 **`value`**（不是 `text`/`seed`/`duration`）；
+`RandomNoise` 是 **`noise_seed`**；`LoadImage` 是 **`image`**。绑错 = ComfyTV **静默忽略** = 改参数不生效。
+（MCP 的 `bind` 操作会在服务端替你校验这两条，见 §5.2；HTTP 路径要自己查。）
+
+**preset 模板**（官方 r2v/t2v 精简骨架；按你的节点 id 改）：
+
+```jsonc
+{
+  "label": "<与工作流行 label 一致>",
+  "order": 100,
+  "description": "<workflow 下拉里显示的说明：模型、参考槽上限、建议时长>",
+  "result": { "type": "ui_save_url", "node": "<最终视频保存节点 id>" },
+  "meta":   { "mention_style": "minimax_tags" },     // 让提示词里 @image_N 展开成 H3 训练用的 <Picture n> 标签
+  "sizing": { "snap": 32 },                          // H3/latent 尺寸对齐 32；错误的 snap = 尺寸引擎算出非法分辨率
+  "inputs": {
+    "<主节点>": {
+      "prompt": { "from": "main_prompt", "required": true, "error": "H3 需要提示词。" },
+      "width":  { "from": "computed:width",  "cast": "int" },
+      "height": { "from": "computed:height", "cast": "int" }
+    },
+    "<秒数节点>": { "value": { "from": "option:duration_s", "cast": "float" } },
+    "<RandomNoise>": { "noise_seed": { "from": "option:seed", "default": "random_int31", "cast": "int" } },
+    "<LoadImage#1>": { "image": { "from": "upstream_image:annotated[0]" } }
+  },
+  "prune_when_missing": [
+    { "when": "upstream_image:value[0]",
+      "drop_upstream_of": [ { "node": "<主节点>", "input": "ref_images.ref_image_0" } ] }
+  ]
+}
+```
+
+**`from` 合法文法**（服务端正则 `_FROM_RE`，写错会被 MCP 拒/自己坑自己）：
+
+```
+main_prompt | literal:<值> | option:<key> | computed:(width|height|length)
+upstream_(image|video|audio|text|model):(annotated|value|masked)[N]
+```
+
+其余字段：`cast ∈ {int, float, str}`；`required`+`error`（缺输入时给用户看的话）；
+`default`（`option:` 解析兜底，seed 用 `"random_int31"` = 每次 Run 随机 31 位整数）；
+`prune_when_missing`：**没接线的参考槽必须 prune**，否则空槽提交直接报错——多参考 H3 必配（照抄官方 r2v）。
+
+**放置**：`user/comfytv/workflows/video/<工作流文件名>_preset.json`（与工作流文件同名同目录）。
+
+### 3.3 生成/修复 api_json
+
+```bash
+# 首选：服务端官方转换器（bypass 直通、widget 按 schema 顺序、前端专用节点剔除，全是官方行为）
+curl -s -X POST http://127.0.0.1:8188/comfytv/workflows/convert \
+  -H 'Content-Type: application/json' -d '{"kind":"video","label":"<label>"}'
+# 等价兜底：随便 Run 一次，api_json 缺失时会自动转换
+# （若你手改过 api_json：POST /comfytv/workflows/api_json，必须带该行当前 file_mtime，否则不生效）
+```
+
+`convert` 报 `WorkflowConversionError` ⇒ 看错误信息修画布（常见：节点类没在 `/object_info` 注册 = 缺插件）。
+
+### 3.4 应用 preset
+
+```bash
+# 新入库行：rescan/import 时已自动应用（seed.py: 只对新行）
+# 已存在的行改了 preset ⇒ 必须手动重放：
+curl -s -X POST http://127.0.0.1:8188/comfytv/workflows/<workflow_id>/reset_to_preset -H 'Content-Type: application/json' -d '{}'
+```
+
+⚠️ `reset_to_preset` 的副作用（源码 `reset_workflow_to_preset`）：**删掉现有全部绑定 → 把 label/order/description 重置为
+文件 stem / 100 / preset 的 description → 再应用 preset**。所以：工作流文件名 = 你想要的最终 label；preset 里要带 description。
+没有 preset 文件的行会返回 404 "no shipped preset"。
+
+### 3.5 stage 参数校准（"直接能用"检查单）
+
+VideoStage 的 widget 全表（源码 `nodes/stages/generators.py::VideoStage`）：
+
+| widget | 类型/范围 | H3 校准要点 |
+|---|---|---|
+| `workflow` | 下拉，kind=video | 注册后确认列表里有你的 label |
+| `resolution` | `480P/720P/1K/1080P/1440P/2K/2160P/4K`，默认 720P | 与 `aspect_ratio` 一起经 sizing 引擎算 `computed:width/height`；**preset 必须绑这两个 computed + `sizing.snap:32`** |
+| `aspect_ratio` | `1:1/9:16/16:9/3:4/4:3/3:2/2:3/4:5/5:4/21:9`，默认 16:9 | 同上 |
+| `duration_s` | 整数滑杆 **1–120，默认 5** | 绑 `option:duration_s`。⚠️ 滑杆上限 120s ≠ 模型能力——**H3 这类大模型长时长在消费级显存上很容易 OOM**（经验上 >10s 就高风险），建议 5s；把关只能靠工作流内的表达式 clamp 或用户纪律，ComfyTV 不会替你拦 |
+| `generate_audio` | bool，默认 false | H3 自带音频；**不绑就等于无事发生**，别误以为它控制 H3 出声 |
+| `main_prompt` + `texts[6]` | 文本 | 绑 `main_prompt`（required + error 文案） |
+| `images[9]` | 9 个图槽 | 逐槽绑 `upstream_image:annotated[0..8]` + 逐槽 prune |
+| `videos[4]` / `audio[3]` | 媒体槽 | 用到才绑（官方 r2v 有完整范例） |
+| `custom_params` | JSON | 自定义 stage 参数入口（§5.3） |
+
+**`option:<key>` 解析优先级（校准的核心，源码 `_option_check.py` + `_merge_custom_params`）**：
+
+```
+stage 自身 widget（duration_s/resolution/…）
+→ 该 kind 的 stage 参数默认值（如 seed，Stage Params 里有默认）
+→ preset 绑定里写的 default（如 "random_int31"）
+→ 都没有 ⇒ 运行时【静默为空】
+```
+
+⇒ **每条 `option:` 绑定必须至少命中一环**。验收方法见 §4（`workflow_get` 直接给你 warnings）。
+
+### 3.6 验证（fail-closed，任一不过 = 没绑上）
+
+```bash
+# 全量读回（一条顶十条）：has_api / bindings / result / sizing / prune / exposed_widgets
+curl -s 'http://127.0.0.1:8188/comfytv/workflows/config?kind=video&label=<urlencoded label>'
+```
+
+逐项过：
+
+1. `has_api == true` 且 `api_json` 节点数合理；`result_node` 指向的节点在 `api_json` 里；
+2. `bindings` 非空，且**每条 `node_id` 在 `api_json` 里、`input_name` 在该节点 `inputs` 里**（写个小脚本对一遍，别目测）；
+3. `sizing.snap == 32`、`prune_when_missing` 覆盖所有参考槽；
+4. MCP `workflow_get` 的 **`warnings == []`**（它专查 `option:` 悬空/无默认，§5.2）；
+5. **5 秒冒烟**：画布拖 Video Stage → 选你的 workflow → 5s/720P/16:9 → Run → 出片且分辨率/时长/seed 符合预期 → 换提示词重跑，**产物必须变化**（不变 = 绑定字段名错，回 §3.2）。
+
+---
+
+## 4. Node 2.0 显示开关（最后一步，顺序不能反）
+
+1. **先开 ComfyUI 侧**：ComfyUI 前端 Settings → 找到 **Node 2.0（Vue 节点）** → 启用。
+2. **再开 ComfyTV 侧**：ComfyTV 左侧栏 **Settings → Experimental → 启用 ComfyTV V2 节点**（`enable-v2`）。
+3. **刷新页面**生效。海报模式阈值（`v2-lod-scale`/`v2-lod-fill`）按喜好调。
+4. **坑**（源码/文档明示）：
+   - 实验性功能，官方原话 "expect rough edges"；出渲染问题先关 `enable-v2` 再定位；
+   - rgthree-comfy 插件对 Node 2.0 发出明确警告（不兼容 + 大图 CPU 尖峰），装了 rgthree 的环境要有心理准备；
+   - 只影响显示。**如果开了 2.0 后 stage 行为异常，先关掉再查绑定，不要去改 preset**——绑定跟这个开关无关。
+
+---
+
+## 5. 三种操作界面怎么选
+
+### 5.1 HTTP（本文主线）
+全部端点见 §7 速查卡。适合无 GUI 环境、脚本化。
+
+### 5.2 MCP（推荐 agent 用，带校验）
+
+前置：ComfyTV 侧栏 Settings → **Agent & MCP → Enable MCP server**（默认关）；端点 `POST /comfytv/mcp`。
+workflow 系工具**服务端落库，无需开浏览器 tab**（画布类工具 `add_stage`/`run_stage` 才需要开着的 tab）。
+
+| 工具 | 用途 |
+|---|---|
+| `workflow_get {kind,label}` | 一次拿全：节点清单（含每个节点的 inputs keys）、现有 bindings、**warnings（悬空 option 检查）** |
+| `workflow_edit {kind,label,ops:[…]}` | 绑定/解绑/设 meta（result/sizing/prune）；**每条 bind 服务端校验**：节点在 api 图里 + 输入名存在 + `from` 文法 + cast 白名单 |
+| `stage_params` | 给 stage 加自定义参数，再绑 `option:<key>` |
+| `workflow_create` | 直接用 `graph`（GUI）或 `api_json` 建工作流行 |
+| `reset_to_preset`（作为 workflow_edit 的一个 op） | 重放 preset |
+
+推荐序列：`workflow_create`(或 import) → `convert` → `workflow_edit` 批量 bind → `workflow_get` 看 warnings==[] → 冒烟。
+
+### 5.3 侧栏（人工）
+选中 stage → ComfyTV 侧栏逐项配绑定（即时生效）→ 底部 **⇩ Export preset.json** 导出。
+ComfyTV 官方建议：**preset 通常由侧栏配置后导出，不手写**；agent 手写时抄 §1.3 的官方模板。
+
+---
+
+## 6. 故障排查表
+
+| 症状 | 根因（源码位置） | 修法 |
+|---|---|---|
+| 改了提示词/seed，出片一模一样 | 绑定字段名不在节点 `inputs` 里 → 静默忽略 | 对 `api_json` 核字段名（`value`/`noise_seed`/`image`）→ 重放 preset → 换词重跑验证 |
+| `has_api=false` / 绑定全失效 | 工作流文件 mtime 变了 → `api_json` 被清（`seed.py:487`） | 重新 `POST /comfytv/workflows/convert` |
+| 改了 `_preset.json` 没反应 | 只有**新行** seed 时自动应用 | `POST /comfytv/workflows/{wid}/reset_to_preset` |
+| reset 返回 404 "no shipped preset" | 同目录没有 `<文件stem>_preset.json` | 文件名必须跟工作流文件 stem 完全一致 |
+| reset 后 label 变了 | reset 把 label 重置为文件 stem | 工作流文件名 = 期望 label |
+| `option:xxx` 运行时是空值 | 解析四环全落空 | 加 stage param 默认 / preset 绑定 `default` / 改绑 stage 自己的 widget；用 `workflow_get` warnings 定位 |
+| 接了参考图报"缺输入" | 没接的槽没 prune | 每个参考槽配 `prune_when_missing` |
+| convert 报错 | 节点类不在 `/object_info`（缺插件） | 装对应自定义节点后重启 ComfyUI 再 convert |
+| Run 出片但尺寸不对 | 没绑 `computed:width/height` 或 `sizing.snap` 不是 32 | 补绑 + `POST reset_to_preset` |
+| 拉长时长 OOM | stage 滑杆允许 120s，H3 吃不下 | 自己控制：经验值 ≤10s 更稳（>10s 易 OOM，按你的显存定上限）；或工作流内 clamp |
+| 画布上节点样式不对/想换新外壳 | 显示层问题 | §5 顺序开 Node 2.0 + enable-v2；仍异常就关掉，别动绑定 |
+
+---
+
+## 7. 速查卡
+
+**端点**（基址 `http://127.0.0.1:8188`）：
+
+```text
+GET  /comfytv/workflows?kind=video                # 列表（拿 id/label/is_default）
+POST /comfytv/workflows/import   {kind,filename,content}     # 入库
+POST /comfytv/workflows/rescan                            # 扫目录入库
+POST /comfytv/workflows/convert  {kind,label}              # GUI→api_json（官方转换器）
+POST /comfytv/workflows/api_json {kind,label,api_json,file_mtime}  # 手工覆盖（须带当前 mtime）
+POST /comfytv/workflows/{wid}/reset_to_preset {}           # 重放 preset（副作用见 §3.4）
+GET  /comfytv/workflows/config?kind=video&label=<enc>      # 验证总入口
+GET  /comfytv/workflows/preset?kind=video&label=<enc>      # 导出当前绑定为 preset
+POST /comfytv/mcp                                        # MCP JSON-RPC（需设置里开启）
+```
+
+**preset 字段**：`label / order / description / result{type,node} / meta{mention_style} / sizing{snap} /
+inputs{节点id:{输入名:{from,required,error,cast,default}}} / prune_when_missing[{when,drop_upstream_of[]}]`。
+`result.type ∈ {ui_save_url, ui_save_batch, graph_output_first}`。
+
+**H3 推荐默认**：`snap:32`｜帧长 17k+5（工作流内表达式处理，别手改）｜`seed default:"random_int31"`｜
+`mention_style:"minimax_tags"`（提示词 `@image_N` → `<Picture n>`）｜时长 5s（>10s 易 OOM，按显存定上限）｜
+多参考图逐槽绑定 + 逐槽 prune。
+
+**三条铁律**：① 字段名以 api_json 为准，绑错静默失败；② preset 文件名跟 **文件 stem** 走，改完必须 reset；
+③ 判据只有 `bindings` 表 / `config` 接口 / 实测出片——**UI 控件显示 ≠ 绑上了**。
